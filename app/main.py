@@ -5,7 +5,7 @@ from langdetect import detect, LangDetectException
 from openai import OpenAI
 
 # ---- Config ----
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_TOKENS     = int(os.getenv("MAX_TOKENS", "512"))
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "15"))
