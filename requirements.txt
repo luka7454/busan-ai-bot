@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
-httpx
-python-dotenv
+openai>=1.40.0
+langdetect>=1.0.9
