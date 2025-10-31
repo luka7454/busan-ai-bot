@@ -2,4 +2,4 @@ fastapi
 uvicorn[standard]
 openai>=1.40.0
 langdetect>=1.0.9
-+requests
+requests
