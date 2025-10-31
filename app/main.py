@@ -64,6 +64,20 @@ def kakao_text_plus_card(text, card_obj):
         outputs.extend(card_obj["template"]["outputs"])
     return {"version": "2.0", "template": {"outputs": outputs}}
 
+def kakao_carousel(cards: List[Dict]) -> dict:
+    """여러 장소를 카드 슬라이드로 보여주는 Carousel"""
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [{
+                "carousel": {
+                    "type": "basicCard",
+                    "items": cards
+                }
+            }]
+        }
+    }
+
 # ======================
 # 주소→주소 파싱 & 지도 카드
 # ======================
@@ -86,11 +100,9 @@ def parse_addr_to_addr(utter):
 def build_directions_card(start_addr, end_addr, lang="en"):
     o = urllib.parse.quote_plus(start_addr.strip())
     d = urllib.parse.quote_plus(end_addr.strip())
-
-    gmaps = f"https://www.google.com/maps/dir/?api=1&origin={o}&destination={d}&travelmode=transit"
+    gmaps = f"https://www.google.com/maps/dir/?api=1&origin={o}&destination={d}"
     kmapw = f"https://map.kakao.com/?sName={o}&eName={d}"
-    amap  = f"https://maps.apple.com/?saddr={o}&daddr={d}&dirflg=r"
-
+    amap  = f"https://maps.apple.com/?saddr={o}&daddr={d}"
     if lang == "ko":
         title = "길찾기"
         desc  = f"{start_addr} → {end_addr}\n원하는 지도에서 열어보세요."
@@ -107,12 +119,8 @@ def build_directions_card(start_addr, end_addr, lang="en"):
             {"action": "webLink", "label": "Kakao Map (Web)", "webLinkUrl": kmapw},
             {"action": "webLink", "label": "Apple Maps", "webLinkUrl": amap},
         ]
-
-    return kakao_basic_card(
-        title=title,
-        description=desc,
-        buttons=btns,
-        image_url="https://t1.daumcdn.net/localimg/localimages/07/mapapidoc/marker_red.png"
+    return kakao_basic_card(title, desc, btns,
+        "https://t1.daumcdn.net/localimg/localimages/07/mapapidoc/marker_red.png"
     )
 
 def guess_lang(text):
@@ -142,38 +150,10 @@ def _naver_search(query, size):
         logger.warning(f"[naver_search] {e}")
         return []
 
-def _google_cse(query, size):
-    if not (GOOGLE_CSE_ID and GOOGLE_API_KEY):
-        return []
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {"q": query, "cx": GOOGLE_CSE_ID, "key": GOOGLE_API_KEY, "num": size}
-    try:
-        r = requests.get(url, params=params, timeout=SEARCH_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("items", [])[:size]
-        return [{"title": it.get("title", ""), "snippet": it.get("snippet", ""), "link": it.get("link", "")} for it in items]
-    except Exception as e:
-        logger.warning(f"[google_cse] {e}")
-        return []
-
 def web_search(query, size=3):
     if not SEARCH_ENABLED:
         return []
-    providers = []
-    if SEARCH_PROVIDER in ("auto", "naver"):
-        providers.append(_naver_search)
-    if SEARCH_PROVIDER in ("auto", "google"):
-        providers.append(_google_cse)
-
-    for fn in providers:
-        try:
-            results = fn(query, size)
-            if results:
-                return results[:size]
-        except Exception as e:
-            logger.warning(f"[web_search] {e}")
-    return []
+    return _naver_search(query, size)
 
 def format_web_context(results):
     if not results:
@@ -181,26 +161,44 @@ def format_web_context(results):
     return "\n\n".join([f"[{i+1}] {r['title']}\n{r['snippet']}\n{r['link']}" for i, r in enumerate(results)])
 
 # ======================
-# 제주시 SYSTEM PROMPT
+# Jeju SYSTEM PROMPT
 # ======================
 SYSTEM_PROMPT = """
 You are the Jeju City AI Assistant.
 
-Knowledge scope (not exhaustive):
-- Geography & districts: Aewol, Hallim, Jocheon, Gujwa, Samyang, Ido, Seogwipo (for comparison), Jeju International Airport, Hallasan National Park.
-- Transportation: Jeju Airport limousine buses, rental cars, local buses (e.g., 181, 182), taxi fare ranges, airport parking, ferry & cruise port info.
-- Tourism: Hallasan trails (Seongpanak, Gwaneumsa), beaches (Hamdeok, Iho Tewoo, Hyeopjae, Gwakji), theme parks (EcoLand, Jeju Stone Park), museums (OSULLOC, Art Jeju), markets (Dongmun, 5-day markets).
-- Food: black pork (heuk-dwaeji), abalone dishes, sea urchin bibimbap, Jeju tangerines, hallabong, seafood stew, famous cafes with sea view.
-- Accommodation: ocean-view resorts, pensions, boutique hotels in Aewol and Hamdeok, check-in/out conventions.
-- Culture & nature: tangerine farms, Oreum volcanic cones, Olle walking trails, UNESCO heritage (Geopark, Seongsan Ilchulbong, Manjanggul Cave).
-- Weather: four-season wind patterns, typhoon season, best visiting months.
-- Safety/etiquette: driving rules, parking on tourist routes, beach flags, environmental protection.
-- If a question needs live info (festival schedules, flights, weather, service notices), you may rely on provided "web context" below.
+Knowledge scope:
+- Jeju districts: Aewol, Hallim, Jocheon, Gujwa, Samyang, Ido, Seogwipo (for comparison)
+- Tourism: Hallasan trails, Hamdeok, Iho Tewoo, Hyeopjae, Gwakji beaches, EcoLand, OSULLOC, Dongmun market
+- Food: black pork, abalone, sea urchin bibimbap, tangerines, hallabong, seafood stew, cafes with sea view
+- Weather & transportation: airport buses, rental cars, routes, typhoon season
 Behavior:
 - Always reply in the same language as the user's message.
-- Be concise, friendly, and practical. Provide mini itineraries, nearest attractions, expected travel times, and cultural notes when relevant.
-- When using "web context," cite URLs inline in natural language (e.g., 'according to ... (URL)') rather than markdown.
+- Provide friendly, concise, practical answers for Jeju visitors.
 """
+
+# ======================
+# 명소 카드 데이터 (기본 3곳)
+# ======================
+JEJU_SPOTS = [
+    {
+        "title": "성산일출봉",
+        "desc": "제주를 대표하는 일출 명소로, UNESCO 세계자연유산에 등재된 곳이에요.",
+        "img": "https://api.cdn.visitjeju.net/photomng/imgpath/202009/10/2020091009043672295d3c-9b69-4a9b-a0ec-2d24f8e2df4c.jpg",
+        "link": "https://map.kakao.com/?q=성산일출봉"
+    },
+    {
+        "title": "협재해변",
+        "desc": "에메랄드빛 바다와 하얀 모래로 유명한 서쪽 대표 해변입니다.",
+        "img": "https://api.cdn.visitjeju.net/photomng/imgpath/202103/19/20210319024335214f0668-5a4f-4d1e-b31a-7a773e9482b0.jpg",
+        "link": "https://map.kakao.com/?q=협재해변"
+    },
+    {
+        "title": "한라산 국립공원",
+        "desc": "대한민국에서 가장 높은 산으로, 사계절 내내 다른 풍경을 보여줍니다.",
+        "img": "https://api.cdn.visitjeju.net/photomng/imgpath/201910/14/2019101409570831a2c4ff-fc02-48fa-b4c9-25ad33d93a69.jpg",
+        "link": "https://map.kakao.com/?q=한라산"
+    }
+]
 
 # ======================
 # FastAPI 엔드포인트
@@ -226,20 +224,32 @@ async def kakao_skill(request: Request):
         payload = kakao_text_plus_card(explain, card)
         return Response(content=json.dumps(payload, ensure_ascii=False), media_type="application/json")
 
+    # 명소 추천 트리거 (이미지 카드 자동 표시)
+    if any(k in utter for k in ["명소", "추천", "관광지", "여행지", "어디가 좋아"]):
+        cards = []
+        for s in JEJU_SPOTS:
+            cards.append({
+                "title": s["title"],
+                "description": s["desc"],
+                "thumbnail": {"imageUrl": s["img"]},
+                "buttons": [{"action": "webLink", "label": "지도 보기", "webLinkUrl": s["link"]}]
+            })
+        carousel = kakao_carousel(cards)
+        text = "제주의 인기 명소 TOP 3를 추천드릴게요 🌴"
+        outputs = [{"simpleText": {"text": text}}]
+        outputs.extend(carousel["template"]["outputs"])
+        payload = {"version": "2.0", "template": {"outputs": outputs}}
+        return Response(content=json.dumps(payload, ensure_ascii=False), media_type="application/json")
+
+    # 기본 LLM 응답 (Web Search fallback)
     if not client:
         return Response(content=json.dumps(kakao_text("서버 오류: OPENAI_API_KEY가 없습니다."), ensure_ascii=False),
                         media_type="application/json")
 
-    # Web Search fallback
-    keywords = ["축제", "날씨", "행사", "공연", "운항", "오늘", "이번주", "예약", "공지", "입장료", "휴무"]
-    need_search = any(k in utter for k in keywords)
-    web_ctx = ""
-    if need_search:
-        try:
-            results = web_search(utter, size=SEARCH_MAX_RESULTS)
-            web_ctx = format_web_context(results)
-        except Exception as e:
-            logger.warning(f"[websearch] {e}")
+    results = []
+    if any(k in utter for k in ["날씨", "행사", "축제", "오늘", "이번주", "공지"]):
+        results = web_search(utter)
+    web_ctx = format_web_context(results) if results else ""
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
