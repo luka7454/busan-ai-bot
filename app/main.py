@@ -10,7 +10,7 @@ from fastapi.responses import Response, JSONResponse
 from openai import OpenAI
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 환경변수
+# ENV
 # ──────────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
@@ -25,7 +25,6 @@ NAVER_CLIENT_SECRET  = os.getenv("NAVER_CLIENT_SECRET", "").strip()
 logger = logging.getLogger("uvicorn.error")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 app = FastAPI()
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Kakao 템플릿 유틸
@@ -68,7 +67,6 @@ def kakao_carousel(cards: List[Dict]) -> Dict:
             }]
         }
     }
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 주소 → 주소 파싱 & 지도 카드
@@ -126,12 +124,11 @@ def build_directions_card(start_addr: str, end_addr: str, lang: str = "en") -> D
 def guess_lang(text: str) -> str:
     return "ko" if any("\uac00" <= ch <= "\ud7a3" for ch in (text or "")) else "en"
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 네이버 검색 (실패 원인 로깅 포함)
+# 네이버 검색 (로그 강화)
 # ──────────────────────────────────────────────────────────────────────────────
 def _naver_search(query: str, size: int) -> List[Dict]:
-    # 지연 임포트: requests 미설치 시 서버가 안 뜨는 문제 방지
+    # 지연 임포트: requests 미설치여도 서버 부팅은 되게
     try:
         import requests  # type: ignore
     except Exception:
@@ -176,14 +173,37 @@ def web_search(query: str, size: int = 3) -> List[Dict]:
 def format_web_context(results: List[Dict]) -> str:
     if not results:
         return ""
-    lines = []
-    for i, r in enumerate(results, 1):
-        lines.append(f"[{i}] {r.get('title','')}\n{r.get('snippet','')}\n{r.get('link','')}")
-    return "\n\n".join(lines)
-
+    return "\n\n".join(
+        f"[{i+1}] {r.get('title','')}\n{r.get('snippet','')}\n{r.get('link','')}"
+        for i, r in enumerate(results)
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SYSTEM PROMPT (제주시)
+# 날씨 전용 카드 유틸
+# ──────────────────────────────────────────────────────────────────────────────
+def pick_weather_links(results: List[Dict]) -> Dict[str, str]:
+    """검색 결과에서 기상청/네이버 날씨 링크를 추출"""
+    out = {"kma": "", "naver": ""}
+    for r in results:
+        link = r.get("link", "")
+        if not out["kma"] and ("weather.go.kr" in link or "kma.go.kr" in link):
+            out["kma"] = link
+        if not out["naver"] and "search.naver.com" in link:
+            out["naver"] = link
+    return out
+
+def kakao_link_card(title: str, desc: str, links: Dict[str, str]) -> Dict:
+    buttons = []
+    if links.get("kma"):
+        buttons.append({"action": "webLink", "label": "기상청 날씨", "webLinkUrl": links["kma"]})
+    if links.get("naver"):
+        buttons.append({"action": "webLink", "label": "네이버 날씨", "webLinkUrl": links["naver"]})
+    if not buttons:
+        buttons.append({"action": "webLink", "label": "네이버 검색", "webLinkUrl": "https://search.naver.com/search.naver?query=제주+날씨"})
+    return kakao_basic_card(title, desc, buttons)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SYSTEM PROMPT (Jeju)
 # ──────────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """
 You are the Jeju City AI Assistant.
@@ -200,7 +220,6 @@ Behavior:
 - Be concise, friendly, and practical. Offer mini-itineraries, nearest stops, expected times when useful.
 - If live info is needed (festival, weather, notices), use provided Web context. Cite URLs inline as plain text.
 """
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 명소 카드(기본 3곳)
@@ -226,9 +245,8 @@ JEJU_SPOTS = [
     }
 ]
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 엔드포인트
+# Endpoints
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
@@ -300,16 +318,32 @@ async def kakao_skill(request: Request):
             media_type="application/json"
         )
 
-    # 실시간 키워드 감지 → 네이버 검색 컨텍스트 주입
+    # 실시간 키워드 감지
     live_keywords = ["축제", "행사", "공연", "날씨", "운항", "운행", "실시간", "시간표",
                      "공지", "폐장", "휴무", "입장료", "요금", "예약", "전시", "대회", "오늘", "이번주", "오늘밤",
                      "festival", "event", "weather", "today", "tonight", "hours", "open", "close"]
-    need_search = any(k in utter for k in live_keywords)
+    lower = utter.lower()
+    need_search = any(k in utter for k in live_keywords) or any(k in lower for k in ["weather"])
 
-    web_ctx = ""
-    if SEARCH_ENABLED and need_search:
-        results = web_search(utter, size=3)
-        web_ctx = format_web_context(results)
+    # 검색 컨텍스트
+    results = web_search(utter, size=3) if (SEARCH_ENABLED and need_search) else []
+    web_ctx = format_web_context(results) if results else ""
+
+    # ✅ 날씨 전용 즉시 카드 (LLM 호출 전 우선 응답)
+    if need_search and any(k in utter for k in ["날씨"]) or ("weather" in lower):
+        links = pick_weather_links(results)
+        lang = guess_lang(utter)
+        if lang == "ko":
+            title = "제주시 실시간 날씨"
+            desc  = "공식 페이지에서 현재 기온·강수·바람 정보를 확인하세요."
+            guide = "아래 버튼을 눌러 확인하세요."
+        else:
+            title = "Jeju City Weather (Live)"
+            desc  = "Open the official page for real-time temperature, precipitation and wind."
+            guide = "Tap a button to check live weather."
+        card = kakao_link_card(title, desc, links)
+        payload = kakao_text_plus_card(guide, card)
+        return Response(content=json.dumps(payload, ensure_ascii=False), media_type="application/json")
 
     # LLM 호출
     messages = [
@@ -317,7 +351,15 @@ async def kakao_skill(request: Request):
         {"role": "user", "content": utter or "안녕하세요"}
     ]
     if web_ctx:
-        messages.append({"role": "system", "content": f"Web context (non-authoritative):\n{web_ctx}"})
+        messages.append({
+            "role": "system",
+            "content": (
+                "If web context is provided, you MUST ground your answer in it. "
+                "Do not say you cannot provide real-time info; summarize what the links indicate "
+                "and include the most relevant URL inline as plain text.\n"
+                "Web context (non-authoritative):\n" + web_ctx
+            )
+        })
 
     try:
         resp = client.chat.completions.create(
