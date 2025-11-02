@@ -4,11 +4,16 @@ import csv
 import re
 import logging
 import asyncio
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional, Tuple
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from openai import OpenAI, APIConnectionError, APITimeoutError
 
+# -------------------------------
+# Logging
+# -------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:  %(message)s")
 logger = logging.getLogger("uvicorn.error")
 
 # -------------------------------
@@ -16,15 +21,16 @@ logger = logging.getLogger("uvicorn.error")
 # -------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "540"))  # 살짝 낮춰 빠르게
-DEADLINE_MS = int(os.getenv("OPENAI_DEADLINE_MS", "2800"))  # 2.8s 내 완료 못하면 폴백
-GREETING_ONLY_MS = int(os.getenv("GREETING_ONLY_MS", "0"))   # 0=비활성(옵션)
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "540"))          # 속도 위해 보수적
+DEADLINE_MS = int(os.getenv("OPENAI_DEADLINE_MS", "1800"))  # 1.8s 내 완료 못하면 폴백
+DISABLE_OPENAI = os.getenv("DISABLE_OPENAI", "0") == "1"    # 1이면 LLM 완전 비활성(즉시 드래프트)
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 DEFAULT_DOCS_DIR = os.path.join(os.path.dirname(__file__), "docs")
 DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR).rstrip("/")
 DOCS_DIR = os.getenv("DOCS_DIR", DEFAULT_DOCS_DIR).rstrip("/")
 
+# 문서 탐색 후보 경로(상대/루트 혼재 대비)
 FALLBACK_DOCS = [
     DOCS_DIR,
     os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs"),
@@ -32,8 +38,16 @@ FALLBACK_DOCS = [
     os.getcwd(),
 ]
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-app = FastAPI(title="Jeju ChatPi", version="1.1.0")
+# OpenAI client (키가 없거나 DISABLE_OPENAI면 None처럼 취급)
+client: Optional[OpenAI] = None
+if OPENAI_API_KEY and not DISABLE_OPENAI:
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        logger.warning(f"[OpenAI] client init fail: {e}")
+        client = None
+
+app = FastAPI(title="Jeju ChatPi", version="1.2.0")
 
 # -------------------------------
 # File helpers
@@ -93,7 +107,7 @@ SYSTEM_PROMPT = f"""
 """
 
 # -------------------------------
-# Guards & utils
+# Kakao helpers & guards
 # -------------------------------
 def kakao_text(text: str) -> dict:
     return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}
@@ -131,7 +145,7 @@ def short_greeting_reply() -> str:
     )
 
 # -------------------------------
-# Mini rule engine (CSV 기반)
+# Mini rule engine (CSV)
 # -------------------------------
 def filter_blacklist(pois: List[Dict], bl: List[Dict]) -> List[Dict]:
     blocked = set()
@@ -149,7 +163,7 @@ def filter_blacklist(pois: List[Dict], bl: List[Dict]) -> List[Dict]:
         out.append(p)
     return out
 
-def apply_congestion_rules(pois: List[Dict], rules: List[Dict]) -> tuple[List[Dict], bool]:
+def apply_congestion_rules(pois: List[Dict], rules: List[Dict]) -> Tuple[List[Dict], bool]:
     high = {(r.get("area") or "").strip() for r in rules if (r.get("level") or "").lower() == "high"}
     filtered = [p for p in pois if (p.get("area") or "").strip() not in high]
     notice = len(filtered) < len(pois)
@@ -193,8 +207,12 @@ def build_draft(utter: str) -> str:
     )
 
 # -------------------------------
-# Fast API
+# FastAPI
 # -------------------------------
+@app.get("/")
+def root():
+    return {"ok": True, "message": "Jeju ChatPi up"}
+
 @app.get("/health")
 def health():
     return {
@@ -203,7 +221,8 @@ def health():
         "model": MODEL,
         "data_dir": DATA_DIR,
         "docs_dir": DOCS_DIR,
-        "deadline_ms": DEADLINE_MS
+        "deadline_ms": DEADLINE_MS,
+        "disable_openai": DISABLE_OPENAI,
     }
 
 @app.post("/kakao/skill")
@@ -216,20 +235,23 @@ async def kakao_skill(request: Request):
 
     # 내부 정보 차단
     if is_internal_probe(utter):
+        logger.info("[Guard] internal probe")
         return JSONResponse(kakao_text("비밀이에요 🤫 공식적으로 공개되지 않은 정보입니다."))
 
     # 짧은 인사/단문 → 즉시 답변 (LLM 미호출)
     if is_short_greeting(utter):
+        logger.info("[Reply] SHORT_GREETING")
         return JSONResponse(kakao_text(short_greeting_reply()))
 
-    # OpenAI 키 없으면 즉시 드래프트
-    if not client:
-        return JSONResponse(kakao_text(build_draft(utter)))
-
-    # 드래프트 먼저 생성 (최대 수백 ms)
+    # 드래프트 먼저 생성 (빠름)
     draft = build_draft(utter)
 
-    # OpenAI 호출을 2.8s 내에서만 시도 (초과하면 폴백)
+    # OpenAI 완전 비활성 모드(운영 안정화)
+    if DISABLE_OPENAI or not client:
+        logger.info("[Reply] DRAFT (DISABLE_OPENAI or no client)")
+        return JSONResponse(kakao_text(draft))
+
+    # OpenAI 호출을 DEADLINE_MS 내에서만 시도 (초과하면 폴백)
     async def call_openai():
         try:
             resp = client.chat.completions.create(
@@ -241,9 +263,9 @@ async def kakao_skill(request: Request):
                 ],
                 temperature=0.2,
                 max_tokens=MAX_TOKENS,
-                timeout=DEADLINE_MS / 1000.0,  # OpenAI SDK 자체 타임아웃
+                timeout=DEADLINE_MS / 1000.0,  # SDK 자체 타임아웃
             )
-            return resp.choices[0].message.content.strip()
+            return (resp.choices[0].message.content or "").strip()
         except (APITimeoutError, APIConnectionError) as e:
             logger.warning(f"[OpenAI] timeout/conn: {e}")
             return None
@@ -252,12 +274,13 @@ async def kakao_skill(request: Request):
             return None
 
     try:
-        # asyncio.wait_for 로 전체 요청을 DEADLINE_MS 내로 제한
-        answer = await asyncio.wait_for(call_openai(), timeout=DEADLINE_MS / 1000.0 + 0.2)
+        answer = await asyncio.wait_for(call_openai(), timeout=(DEADLINE_MS / 1000.0 + 0.2))
         if answer:
+            logger.info("[Reply] LLM")
             return JSONResponse(kakao_text(answer))
         else:
+            logger.info("[Reply] DRAFT (no LLM)")
             return JSONResponse(kakao_text(draft))
     except asyncio.TimeoutError:
-        # 절대 5초 넘기지 않게 즉시 폴백
+        logger.info("[Reply] DRAFT (timeout)")
         return JSONResponse(kakao_text(draft))
