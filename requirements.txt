@@ -1,14 +1,5 @@
-<<<<<<< HEAD
-
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-openai>=1.30.0
-requests>=2.31.0
-python-dotenv>=1.0.1
-=======
-fastapi
-uvicorn[standard]
-openai>=1.40.0
-langdetect>=1.0.9
-requests
->>>>>>> 282b89bd345312e474a3c6206b90f2d23913d536
+openai>=1.30.0,<2
+requests>=2.31.0,<3
+python-dotenv>=1.0.1,<2
