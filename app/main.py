@@ -3,10 +3,11 @@ import json
 import csv
 import re
 import logging
+import asyncio
 from typing import List, Dict, Tuple, Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -15,15 +16,15 @@ logger = logging.getLogger("uvicorn.error")
 # -------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "700"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "540"))  # 살짝 낮춰 빠르게
+DEADLINE_MS = int(os.getenv("OPENAI_DEADLINE_MS", "2800"))  # 2.8s 내 완료 못하면 폴백
+GREETING_ONLY_MS = int(os.getenv("GREETING_ONLY_MS", "0"))   # 0=비활성(옵션)
 
-# default: app/data, app/docs
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 DEFAULT_DOCS_DIR = os.path.join(os.path.dirname(__file__), "docs")
 DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR).rstrip("/")
 DOCS_DIR = os.getenv("DOCS_DIR", DEFAULT_DOCS_DIR).rstrip("/")
 
-# also try these when reading .md
 FALLBACK_DOCS = [
     DOCS_DIR,
     os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs"),
@@ -32,7 +33,7 @@ FALLBACK_DOCS = [
 ]
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-app = FastAPI(title="Jeju ChatPi", version="1.0.0")
+app = FastAPI(title="Jeju ChatPi", version="1.1.0")
 
 # -------------------------------
 # File helpers
@@ -60,7 +61,7 @@ def read_md(filename: str) -> str:
     return ""
 
 # -------------------------------
-# Build System Prompt from docs
+# Build System Prompt
 # -------------------------------
 readme_text = read_md("README_jeju_planner_v1.md")
 rule_spec_text = read_md("jeju_rule_engine_spec.md")
@@ -92,7 +93,7 @@ SYSTEM_PROMPT = f"""
 """
 
 # -------------------------------
-# Guards & small utils
+# Guards & utils
 # -------------------------------
 def kakao_text(text: str) -> dict:
     return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}
@@ -103,6 +104,31 @@ def is_internal_probe(text: str) -> bool:
     t = text.lower()
     keys = ["지침", "룰엔진", "만들어졌", "internal", "prompt", "시스템", "csv", "데이터셋", "코드 보여줘", "내용 보여줘"]
     return any(k in t for k in keys)
+
+def is_short_greeting(text: str) -> bool:
+    if not text:
+        return False
+    t = re.sub(r"\s+", "", text)
+    return t in {"안녕", "안녕하세요", "hi", "hello", "ㅎㅇ", "하이"}
+
+ASK_FLOW = [
+    "몇 박을 머무실 예정인가요?",
+    "숙소 유형은 무엇인가요? (호텔/리조트/일반호텔/펜션/민박/여관)",
+    "여행 분위기는 어디에 집중하시나요? (도시·문화 / 산·자연 / 바다·해변)",
+    "음식 취향은 어떤가요? (해산물 / 한식 / 카페·디저트 / 가성비 / 특별한 경험식당 등)",
+    "(선택) 동행 인원·구성을 알려주세요. (커플 / 가족(아이 포함) / 친구 / 단체 등)"
+]
+
+def short_greeting_reply() -> str:
+    return (
+        "📌 여행 기본 팁\n"
+        "먼저 여행 조건 몇 가지만 알려주시면 딱 맞게 추천해드릴게요.\n\n"
+        "📍 추천 여행지 & 코스 아이디어\n"
+        f"1) {ASK_FLOW[0]}\n2) {ASK_FLOW[1]}\n3) {ASK_FLOW[2]}\n4) {ASK_FLOW[3]}\n5) {ASK_FLOW[4]}\n\n"
+        "🍽️ 맛집 추천\n"
+        "조건을 알려주시면 이동 동선에 맞춰 2~3곳으로 압축해 드릴게요.\n\n"
+        "최신 운영시간과 예약은 공식 안내 확인이 필요합니다."
+    )
 
 # -------------------------------
 # Mini rule engine (CSV 기반)
@@ -135,37 +161,10 @@ def pick_courses() -> List[Dict]:
         items = read_csv_dicts("jeju_sample_halfday_courses.csv")
     return items[:3]
 
-# -------------------------------
-# API
-# -------------------------------
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "has_openai_key": bool(OPENAI_API_KEY),
-        "model": MODEL,
-        "data_dir": DATA_DIR,
-        "docs_dir": DOCS_DIR
-    }
-
-@app.post("/kakao/skill")
-async def kakao_skill(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    utter = ((body.get("userRequest") or {}).get("utterance") or "").strip()
-
-    if is_internal_probe(utter):
-        return JSONResponse(kakao_text("비밀이에요 🤫 공식적으로 공개되지 않은 정보입니다."))
-    if not client:
-        return JSONResponse(kakao_text("서버 설정 오류: OPENAI_API_KEY 필요"))
-
-    # CSV → rule engine
+def build_draft(utter: str) -> str:
     bl = read_csv_dicts("jeju_access_blacklist.csv")
     cong = read_csv_dicts("jeju_congestion_rules.csv")
-    pois = pick_courses()
-    pois = filter_blacklist(pois, bl)
+    pois = filter_blacklist(pick_courses(), bl)
     pois, cong_notice = apply_congestion_rules(pois, cong)
 
     tips = [
@@ -186,27 +185,79 @@ async def kakao_skill(request: Request):
         "- 카페·디저트 1곳 포함해 휴식 동선 구성",
     ]
 
-    draft = (
+    return (
         "📌 여행 기본 팁\n" + "\n".join(tips[:5]) + "\n\n" +
         "📍 추천 여행지 & 코스 아이디어\n" + "\n".join(course_lines[:5]) + "\n\n" +
         "🍽️ 맛집 추천\n" + "\n".join(eat_lines[:5]) + "\n\n" +
         "최신 운영시간과 예약은 공식 안내 확인이 필요합니다."
     )
 
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": utter},
-                {"role": "system", "content": "아래 초안을 지침 톤/형식에 맞게 다듬어 출력하세요.\n" + draft},
-            ],
-            temperature=0.2,
-            max_tokens=MAX_TOKENS,
-        )
-        answer = resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.exception(f"OpenAI error: {e}")
-        answer = draft
+# -------------------------------
+# Fast API
+# -------------------------------
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "has_openai_key": bool(OPENAI_API_KEY),
+        "model": MODEL,
+        "data_dir": DATA_DIR,
+        "docs_dir": DOCS_DIR,
+        "deadline_ms": DEADLINE_MS
+    }
 
-    return JSONResponse(kakao_text(answer))
+@app.post("/kakao/skill")
+async def kakao_skill(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    utter = ((body.get("userRequest") or {}).get("utterance") or "").strip()
+
+    # 내부 정보 차단
+    if is_internal_probe(utter):
+        return JSONResponse(kakao_text("비밀이에요 🤫 공식적으로 공개되지 않은 정보입니다."))
+
+    # 짧은 인사/단문 → 즉시 답변 (LLM 미호출)
+    if is_short_greeting(utter):
+        return JSONResponse(kakao_text(short_greeting_reply()))
+
+    # OpenAI 키 없으면 즉시 드래프트
+    if not client:
+        return JSONResponse(kakao_text(build_draft(utter)))
+
+    # 드래프트 먼저 생성 (최대 수백 ms)
+    draft = build_draft(utter)
+
+    # OpenAI 호출을 2.8s 내에서만 시도 (초과하면 폴백)
+    async def call_openai():
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": utter},
+                    {"role": "system", "content": "아래 초안을 지침 톤/형식에 맞게 다듬어 출력하세요.\n" + draft},
+                ],
+                temperature=0.2,
+                max_tokens=MAX_TOKENS,
+                timeout=DEADLINE_MS / 1000.0,  # OpenAI SDK 자체 타임아웃
+            )
+            return resp.choices[0].message.content.strip()
+        except (APITimeoutError, APIConnectionError) as e:
+            logger.warning(f"[OpenAI] timeout/conn: {e}")
+            return None
+        except Exception as e:
+            logger.exception(f"[OpenAI] error: {e}")
+            return None
+
+    try:
+        # asyncio.wait_for 로 전체 요청을 DEADLINE_MS 내로 제한
+        answer = await asyncio.wait_for(call_openai(), timeout=DEADLINE_MS / 1000.0 + 0.2)
+        if answer:
+            return JSONResponse(kakao_text(answer))
+        else:
+            return JSONResponse(kakao_text(draft))
+    except asyncio.TimeoutError:
+        # 절대 5초 넘기지 않게 즉시 폴백
+        return JSONResponse(kakao_text(draft))
