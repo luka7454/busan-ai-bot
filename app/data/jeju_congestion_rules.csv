@@ -1,0 +1,5 @@
+poi_id,month_band,dow_band,tod_band,event_flag,parking_capacity,score,hint_msg,last_verified
+POI_HYE,7-8,weekend,mid,0,150,85,성수기 혼잡 매우 높음. 9시 전 도착 또는 순서 변경 권장.,2025-10-30
+POI_AEW,7-8,weekend,late,1,120,88,일몰 시간대 혼잡. 대체 주차장/카페 우선.,2025-10-30
+POI_SSN,4-5,weekend,mid,0,300,72,봄 성수기. 10~14시 대기 발생 가능.,2025-10-30
+POI_JUNG,all,weekday,mid,0,800,55,중문권 일반 혼잡. 주차 유료구간 안내.,2025-10-30

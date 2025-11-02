@@ -1,0 +1,4 @@
+place_id,place_name,polygon_wkt,rule_type,start_date,end_date,days_of_week,hours,condition_key,policy_msg,source_org,source_url,last_verified,severity
+BLK_ORUM_001,모오름(자연휴식년제),POLYGON(...),휴식년제,2025-02-01,2025-12-31,*,*,,자연휴식년제 시행 구간. 탐방 금지.,제주시,,2025-10-30,high
+BLK_CLIFF_002,용머리해안 절벽구간,POLYGON(...),기상특보 통제,,,*,*,weather.wind>12m/s OR tide.high=TRUE,강풍/만조 시 출입 통제.,서귀포시,,2025-10-30,high
+BLK_TRAIL_003,사려니숲 일부 보수구간,LINESTRING(...),공사,2025-10-01,2025-11-30,*,*,,"공사로 부분 통제, 우회로 이용.",제주특별자치도,,2025-10-30,medium
