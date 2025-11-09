@@ -40,7 +40,7 @@ DOCS_DIR            = os.getenv("DOCS_DIR", DEFAULT_DOCS_DIR).rstrip("/")
 # -------------------------------
 # OpenAI client (optional)
 # -------------------------------
-client: Optional[object] = None  # ← OpenAI 타입 대신 object로 둬서 평가 문제 회피
+client: Optional[object] = None
 if OPENAI_API_KEY and not FAST_ONLY:
     try:
         from openai import OpenAI
@@ -50,8 +50,11 @@ if OPENAI_API_KEY and not FAST_ONLY:
         logger.warning(f"[OpenAI] client init fail: {e}")
         client = None
 
-        logger.warning(f"[OpenAI] client init fail: {e}")
-        client = None
+# -------------------------------
+# FastAPI app  ←★ 전역! (앞에 공백/탭 절대 x)
+# -------------------------------
+from fastapi import FastAPI  # 이미 위에서 import 했으면 중복 제거 ok
+app = FastAPI(title="Jeju ChatPi (Callback)", version="2.2.0")
 
 
 # -------------------------------
