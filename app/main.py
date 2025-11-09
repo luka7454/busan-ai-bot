@@ -108,17 +108,8 @@ def kakao_bubble(text: str) -> dict:
 
 def is_internal_probe(text: str) -> bool:
     t = (text or "").lower()
-    # “보여줘/공개/원본/내용/설명” 같은 노출 요구가 있을 때만 발동
-    sensitive = ["지침", "룰엔진", "시스템 프롬프트", "system prompt", "prompt", "내부", "데이터셋"]
-    reveal_verbs = ["보여줘", "공개", "원문", "원본", "덤프", "출력", "내용", "설명", "어떻게 만들어졌", "설계"]
-    hit_sens = any(s in t for s in sensitive)
-    hit_verb  = any(v in t for v in reveal_verbs)
-    if hit_sens and hit_verb:
-        # 디버그: 어떤 키워드로 막혔는지 로그 남김
-        logging.info(f"[Guard] block hit (sens={hit_sens}, verb={hit_verb}) text='{t[:80]}'")
-        return True
-    return False
-
+    keys = ["지침", "룰엔진", "만들어졌", "internal", "prompt", "csv", "데이터셋", "코드 보여줘"]
+    return any(k in t for k in keys)
 
 def is_short_greeting(text: str) -> bool:
     t = re.sub(r"\s+", "", text or "")
