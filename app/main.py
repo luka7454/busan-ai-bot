@@ -1,3 +1,4 @@
+# app/main.py
 import os
 import re
 import csv
@@ -6,40 +7,42 @@ import time
 import logging
 import asyncio
 import urllib.request
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
-# -------------------------------
+# =========================================
 # Logging
-# -------------------------------
+# =========================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:  %(message)s")
 logger = logging.getLogger("uvicorn.error")
 
-# -------------------------------
+# =========================================
 # ENV
-# -------------------------------
+# =========================================
 OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL        = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-OPENAI_DEADLINE_MS  = int(os.getenv("OPENAI_DEADLINE_MS", "12000"))   # LLM 예산(초과시 드래프트)
+OPENAI_DEADLINE_MS  = int(os.getenv("OPENAI_DEADLINE_MS", "12000"))
 MAX_TOKENS          = int(os.getenv("MAX_TOKENS", "480"))
 
 USE_KAKAO_CALLBACK  = os.getenv("USE_KAKAO_CALLBACK", "1") == "1"
-CALLBACK_MAX_MS     = int(os.getenv("CALLBACK_MAX_MS", "45000"))      # 콜백 토큰 유효시간
+CALLBACK_MAX_MS     = int(os.getenv("CALLBACK_MAX_MS", "45000"))
 CALLBACK_WAIT_TEXT  = os.getenv("CALLBACK_WAIT_TEXT", "생각을 정리하고 있어요 😊 최대 15초 정도 걸려요.")
 FAST_ONLY           = os.getenv("FAST_ONLY", "0") == "1"
 
 GUARD_ENABLED       = os.getenv("GUARD_ENABLED", "1") == "1"
+SESSION_TTL_MIN     = int(os.getenv("SESSION_TTL_MIN", "30"))
 
 DEFAULT_DATA_DIR    = os.path.join(os.path.dirname(__file__), "data")
 DEFAULT_DOCS_DIR    = os.path.join(os.path.dirname(__file__), "docs")
 DATA_DIR            = os.getenv("DATA_DIR", DEFAULT_DATA_DIR).rstrip("/")
 DOCS_DIR            = os.getenv("DOCS_DIR", DEFAULT_DOCS_DIR).rstrip("/")
 
-# -------------------------------
-# Files
-# -------------------------------
+# =========================================
+# File helpers
+# =========================================
 def read_csv_dicts(filename: str) -> List[Dict]:
     path = os.path.join(DATA_DIR, filename)
     try:
@@ -61,20 +64,23 @@ README_TXT  = read_md("README_jeju_planner_v1.md")
 RULE_TXT    = read_md("jeju_rule_engine_spec.md")
 ARRIVED_TXT = read_md("jeju_arrived_mode_prompt_hook.md")
 
-# -------------------------------
+# =========================================
 # Kakao helpers
-# -------------------------------
+# =========================================
 def kakao_text(text: str) -> dict:
     return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}
 
 def kakao_bubble(text: str) -> dict:
+    # 필요 시 카드/리치 템플릿으로 교체 가능
     return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}
 
 def is_short_greeting(text: str) -> bool:
     t = re.sub(r"\s+", "", text or "")
     return t in {"안녕", "안녕하세요", "hi", "hello", "ㅎㅇ", "하이"}
 
-# 내부 공개요구만 차단 (오탐 최소화 + 토글)
+# =========================================
+# Guard (내부정보 공개 요구만 차단, 오탐 최소화)
+# =========================================
 def is_internal_probe(text: str) -> bool:
     if not GUARD_ENABLED:
         return False
@@ -92,9 +98,9 @@ def is_internal_probe(text: str) -> bool:
         return True
     return False
 
-# -------------------------------
-# Jeju draft (RAT: Retrieval + Augmented Templating)
-# -------------------------------
+# =========================================
+# Draft builder (CSV + 룰)
+# =========================================
 ASK_FLOW = [
     "몇 박을 머무실 예정인가요?",
     "숙소 유형은 무엇인가요? (호텔/리조트/일반호텔/펜션/민박/여관)",
@@ -164,9 +170,127 @@ def build_draft(utter: str) -> str:
         "최신 운영시간과 예약은 공식 안내 확인이 필요합니다."
     )
 
-# -------------------------------
+# =========================================
+# Session (슬롯 필링)
+# =========================================
+class SessionStore:
+    def __init__(self):
+        self.buf = {}  # botUserKey -> {"slots": {...}, "updated": datetime}
+
+    def get(self, key: str) -> dict:
+        s = self.buf.get(key)
+        if not s:
+            s = {"slots": {
+                    "nights": None,
+                    "lodging": None,
+                    "vibe": None,
+                    "food": None,
+                    "group": None
+                },
+                "updated": datetime.utcnow()
+            }
+            self.buf[key] = s
+        if datetime.utcnow() - s["updated"] > timedelta(minutes=SESSION_TTL_MIN):
+            s["slots"] = {k: None for k in s["slots"].keys()}
+        return s
+
+    def update(self, key: str, **kwargs):
+        s = self.get(key)
+        for k, v in kwargs.items():
+            if v:
+                s["slots"][k] = v
+        s["updated"] = datetime.utcnow()
+        self.buf[key] = s
+
+    def reset(self, key: str):
+        if key in self.buf:
+            self.buf[key]["slots"] = {k: None for k in self.buf[key]["slots"].keys()}
+            self.buf[key]["updated"] = datetime.utcnow()
+
+SESS = SessionStore()
+
+NIGHTS_RE = re.compile(r"(\d+)\s*박")
+
+def parse_nights(t: str) -> Optional[str]:
+    m = NIGHTS_RE.search(t)
+    if m:
+        return f"{m.group(1)}박"
+    m2 = re.search(r"(\d+)\s*박\s*(\d+)\s*일", t)
+    if m2:
+        return f"{m2.group(1)}박"
+    return None
+
+def parse_lodging(t: str) -> Optional[str]:
+    opts = ["리조트", "호텔", "일반호텔", "펜션", "민박", "여관"]
+    for o in opts:
+        if o in t:
+            return o
+    return None
+
+def parse_vibe(t: str) -> Optional[str]:
+    if any(k in t for k in ["바다", "해변"]): return "바다·해변"
+    if any(k in t for k in ["산", "자연"]): return "산·자연"
+    if any(k in t for k in ["도시", "문화"]): return "도시·문화"
+    return None
+
+def parse_food(t: str) -> Optional[str]:
+    opts = ["해산물", "한식", "카페", "카페·디저트", "디저트", "가성비", "특별한 경험", "특별한 경험식당"]
+    for o in opts:
+        if o in t:
+            return "카페·디저트" if o in ["카페", "디저트"] else ("특별한 경험식당" if "특별" in o else o)
+    return None
+
+def parse_group(t: str) -> Optional[str]:
+    opts = ["가족", "가족(아이 포함)", "커플", "친구", "단체"]
+    for o in opts:
+        if o in t:
+            return "가족(아이 포함)" if "가족" in o else o
+    if any(k in t for k in ["아이", "아기", "유아"]):
+        return "가족(아이 포함)"
+    return None
+
+def extract_slots(utter: str) -> dict:
+    t = utter.strip()
+    return {
+        "nights": parse_nights(t),
+        "lodging": parse_lodging(t),
+        "vibe": parse_vibe(t),
+        "food": parse_food(t),
+        "group": parse_group(t),
+    }
+
+QUESTIONS = {
+    "nights": "몇 박을 머무실 예정인가요?",
+    "lodging": "숙소 유형은 무엇인가요? (호텔/리조트/일반호텔/펜션/민박/여관)",
+    "vibe": "여행 분위기는 어디에 집중하시나요? (도시·문화 / 산·자연 / 바다·해변)",
+    "food": "음식 취향은 어떤가요? (해산물 / 한식 / 카페·디저트 / 가성비 / 특별한 경험식당 등)",
+    "group": "(선택) 동행 인원·구성을 알려주세요. (커플 / 가족(아이 포함) / 친구 / 단체 등)",
+}
+ORDER = ["nights", "lodging", "vibe", "food", "group"]
+
+def next_missing(slots: dict) -> Optional[str]:
+    for k in ORDER:
+        if slots.get(k) in (None, "", []):
+            return k
+    return None
+
+def slot_summary(slots: dict) -> str:
+    return " | ".join([
+        f"숙박: {slots['nights'] or '-'}",
+        f"숙소: {slots['lodging'] or '-'}",
+        f"분위기: {slots['vibe'] or '-'}",
+        f"음식: {slots['food'] or '-'}",
+        f"동행: {slots['group'] or '-'}",
+    ])
+
+def build_personalized(utter: str, slots: dict) -> str:
+    base = build_draft(utter)
+    header = f"🧭 조건 요약: {slot_summary(slots)}\n\n"
+    return header + base
+
+# =========================================
 # OpenAI client
-# -------------------------------
+# =========================================
 client: Optional[object] = None
 if OPENAI_API_KEY and not FAST_ONLY:
     try:
@@ -182,14 +306,14 @@ else:
     if FAST_ONLY:
         logger.info("[OpenAI] FAST_ONLY=1 (LLM disabled)")
 
-# -------------------------------
-# FastAPI app (global)
-# -------------------------------
-app = FastAPI(title="Jeju ChatPi (Callback)", version="2.3.0")
+# =========================================
+# FastAPI app
+# =========================================
+app = FastAPI(title="Jeju ChatPi (Callback + Slots)", version="3.0.0")
 
-# -------------------------------
-# LLM Polish
-# -------------------------------
+# =========================================
+# LLM polish
+# =========================================
 async def polish_with_llm(utter: str, draft: str, timeout_s: float) -> Optional[str]:
     if FAST_ONLY or not client:
         return None
@@ -217,15 +341,15 @@ async def polish_with_llm(utter: str, draft: str, timeout_s: float) -> Optional[
         logger.warning(f"[OpenAI] error: {e}")
         return None
 
-# -------------------------------
-# Callback sender (small retry)
-# -------------------------------
+# =========================================
+# Callback sender
+# =========================================
 def post_callback(callback_url: str, payload: dict) -> Tuple[bool, str]:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         callback_url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
-    for attempt in range(1, 3):
+    for attempt in range(1, 2 + 1):
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 body = r.read().decode("utf-8", "ignore")
@@ -236,9 +360,9 @@ def post_callback(callback_url: str, payload: dict) -> Tuple[bool, str]:
             time.sleep(0.6)
     return False, "unknown"
 
-# -------------------------------
+# =========================================
 # Routes
-# -------------------------------
+# =========================================
 @app.get("/")
 def root():
     return {
@@ -254,6 +378,7 @@ def health():
         "use_callback": USE_KAKAO_CALLBACK,
         "fast_only": FAST_ONLY,
         "guard_enabled": GUARD_ENABLED,
+        "session_ttl_min": SESSION_TTL_MIN,
         "model": OPENAI_MODEL,
         "deadline_ms": OPENAI_DEADLINE_MS,
         "data_dir": DATA_DIR,
@@ -270,44 +395,59 @@ async def kakao_skill(request: Request, background_tasks: BackgroundTasks):
     user_req    = (body.get("userRequest") or {})
     utter       = (user_req.get("utterance") or "").strip()
     callbackUrl = user_req.get("callbackUrl")
+    user_info   = (user_req.get("user") or {})
+    props       = (user_info.get("properties") or {})
+    user_key    = props.get("botUserKey") or props.get("bot_user_key") or user_info.get("id") or "anon"
 
-    # 내부 정보 차단 (정말 '내부 공개 요구'일 때만)
+    # 내부 정보 차단
     if is_internal_probe(utter):
         logger.warning(f"[Guard] internal probe: {utter}")
         return JSONResponse(kakao_text("비밀이에요 🤫 공식적으로 공개되지 않은 정보입니다."))
 
-    # 짧은 인사 즉시 처리 (LLM 없이)
+    # 세션 제어
+    if any(k in utter for k in ["리셋", "초기화", "처음부터"]):
+        SESS.reset(user_key)
+        return JSONResponse(kakao_text("세션을 초기화했어요. " + QUESTIONS["nights"]))
+
+    # 인사 빠른 응답
     if is_short_greeting(utter):
         text = short_greeting_reply()
         logger.info(f"[ReplyText] {text[:200].replace(os.linesep,' ')}")
         return JSONResponse(kakao_text(text))
 
-    # 초고속 드래프트 생성 (CSV + 규칙)
-    draft = build_draft(utter)
+    # 세션 불러오기 & 이번 발화에서 슬롯 추출/병합
+    sess  = SESS.get(user_key)
+    slots = dict(sess["slots"])
+    found = extract_slots(utter)
+    SESS.update(user_key, **found)
+    slots = SESS.get(user_key)["slots"]
+
+    # 누락된 슬롯 1개씩 질문
+    missing = next_missing(slots)
+    if missing:
+        msg = f"확인했어요! (현재: {slot_summary(slots)})\n\n{QUESTIONS[missing]}"
+        logger.info(f"[ReplyText] {msg[:200].replace(os.linesep,' ')}")
+        return JSONResponse(kakao_text(msg))
+
+    # 모든 슬롯이 채워졌으면 맞춤 드래프트 생성
+    draft = build_personalized(utter, slots)
 
     # ===== 콜백 모드 =====
     if USE_KAKAO_CALLBACK and callbackUrl:
         logger.info("[Callback] useCallback start")
-
-        # 즉시 대기 응답 (템플릿 없이 data만 반환 → 콘솔에서 '스킬데이터 사용'으로 매핑 가능)
         immediate = {"version": "2.0", "useCallback": True, "data": {"text": CALLBACK_WAIT_TEXT}}
 
         async def job():
-            # 콜백 유효시간 안에서 LLM 예산 설정 (최대 20초)
             llm_budget_s = min(max((CALLBACK_MAX_MS - 2000) / 1000.0, 1.0), 20.0)
-            final_text = await polish_with_llm(utter, draft, llm_budget_s)
-            if not final_text:
-                final_text = draft
-
+            final_text = await polish_with_llm(utter, draft, llm_budget_s) or draft
             logger.info(f"[CallbackText] {final_text[:200].replace(os.linesep,' ')}")
             payload = kakao_bubble(final_text)
             ok, msg = post_callback(callbackUrl, payload)
             logger.info(f"[Callback] sent={ok} msg={msg[:180]}")
-
         background_tasks.add_task(job)
         return JSONResponse(immediate)
 
-    # ===== 일반(비 콜백) 모드 =====
+    # ===== 비콜백 모드 =====
     if FAST_ONLY or not client:
         logger.info("[Reply] DRAFT (FAST_ONLY or no client)")
         logger.info(f"[ReplyText] {draft[:200].replace(os.linesep,' ')}")
@@ -318,13 +458,10 @@ async def kakao_skill(request: Request, background_tasks: BackgroundTasks):
 
     try:
         answer = await asyncio.wait_for(call_llm(), timeout=(OPENAI_DEADLINE_MS / 1000.0 + 0.3))
-        if answer:
-            logger.info("[Reply] LLM OK")
-            logger.info(f"[ReplyText] {answer[:200].replace(os.linesep,' ')}")
-            return JSONResponse(kakao_text(answer))
-        logger.info("[Reply] DRAFT (no LLM)")
-        logger.info(f"[ReplyText] {draft[:200].replace(os.linesep,' ')}")
-        return JSONResponse(kakao_text(draft))
+        final_text = answer or draft
+        logger.info("[Reply] LLM OK" if answer else "[Reply] DRAFT (no LLM)")
+        logger.info(f"[ReplyText] {final_text[:200].replace(os.linesep,' ')}")
+        return JSONResponse(kakao_text(final_text))
     except asyncio.TimeoutError:
         logger.info("[Reply] DRAFT (timeout)")
         logger.info(f"[ReplyText] {draft[:200].replace(os.linesep,' ')}")
