@@ -40,13 +40,16 @@ DOCS_DIR            = os.getenv("DOCS_DIR", DEFAULT_DOCS_DIR).rstrip("/")
 # -------------------------------
 # OpenAI client (optional)
 # -------------------------------
-client: Optional[OpenAI] = None
+client: Optional[object] = None  # ← OpenAI 타입 대신 object로 둬서 평가 문제 회피
 if OPENAI_API_KEY and not FAST_ONLY:
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
         logger.info("[OpenAI] client init ok")
     except Exception as e:
+        logger.warning(f"[OpenAI] client init fail: {e}")
+        client = None
+
         logger.warning(f"[OpenAI] client init fail: {e}")
         client = None
 
