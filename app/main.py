@@ -109,15 +109,21 @@ def kakao_bubble(text: str) -> dict:
 GUARD_ENABLED = os.getenv("GUARD_ENABLED", "1") == "1"
 
 def is_internal_probe(text: str) -> bool:
-    if not GUARD_ENABLED:
+    if not text:
         return False
-    t = (text or "").lower()
-    sens = r"(system\s*prompt|시스템\s*프롬프트|prompt|내부|internal|지침|룰엔진|rule\s*engine|설정|spec|스펙)"
-    verb = r"(공개|원문|원본|출력|덤프|누설|노출|설명|어떻게\s*만들어졌|코드|소스|source)"
-    pat = rf"({sens}.*{verb}|{verb}.*{sens})"
-    hit = re.search(pat, t)
-    if hit:
-        logging.info(f"[Guard] block hit: '{t[:120]}' -> {hit.group(0)}")
+    t = text.lower()
+
+    # 내부 시스템 관련 요청만 필터링
+    sensitive_keywords = [
+        "system prompt", "시스템 프롬프트", "internal", "내부 설정",
+        "prompt 내용", "규칙", "rule", "지침", "소스코드", "코드 보여줘"
+    ]
+    trigger_keywords = [
+        "보여줘", "출력", "공개", "설명", "어떻게", "원문", "prompt", "source"
+    ]
+
+    # 민감한 단어와 요청형 단어가 모두 포함될 때만 차단
+    if any(s in t for s in sensitive_keywords) and any(v in t for v in trigger_keywords):
         return True
     return False
 
