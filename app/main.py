@@ -2,15 +2,15 @@ import os
 import csv
 import re
 import json
+import time
 import asyncio
 import logging
 import urllib.request
+import urllib.error
 from typing import List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
-
-# OpenAI SDK (선택)
 from openai import OpenAI, APIConnectionError, APITimeoutError
 
 # -------------------------------
@@ -22,25 +22,20 @@ logger = logging.getLogger("uvicorn.error")
 # -------------------------------
 # ENV & Paths
 # -------------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL        = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_DEADLINE_MS  = int(os.getenv("OPENAI_DEADLINE_MS", "12000"))  # 콜백 경로 LLM 예산(초과 시 드래프트)
+MAX_TOKENS          = int(os.getenv("MAX_TOKENS", "480"))
 
-# 비콜백 경로(직접 응답) 마감시간. 콜백은 아래 CALLBACK_*가 우선.
-OPENAI_DEADLINE_MS = int(os.getenv("OPENAI_DEADLINE_MS", "2000"))
-MAX_TOKENS         = int(os.getenv("MAX_TOKENS", "480"))
+USE_KAKAO_CALLBACK  = os.getenv("USE_KAKAO_CALLBACK", "1") == "1"
+CALLBACK_MAX_MS     = int(os.getenv("CALLBACK_MAX_MS", "45000"))      # 카카오 콜백 토큰 유효시간(최대 60s)
+CALLBACK_WAIT_TEXT  = os.getenv("CALLBACK_WAIT_TEXT", "생각을 정리하고 있어요 😊 최대 15초 정도 걸려요.")
+FAST_ONLY           = os.getenv("FAST_ONLY", "0") == "1"              # 1이면 LLM 완전 비활성
 
-# 콜백 사용 (카카오 AI 챗봇 승인 必)
-USE_KAKAO_CALLBACK = os.getenv("USE_KAKAO_CALLBACK", "1") == "1"
-CALLBACK_MAX_MS    = int(os.getenv("CALLBACK_MAX_MS", "45000"))  # 콜백 URL 유효 60s 내, 45s 권장
-CALLBACK_WAIT_TEXT = os.getenv("CALLBACK_WAIT_TEXT", "생각을 정리하고 있어요 😊 최대 15초 정도 걸려요.")
-
-# LLM 완전 비활성(운영 안정화용 토글)
-FAST_ONLY          = os.getenv("FAST_ONLY", "0") == "1"
-
-DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-DEFAULT_DOCS_DIR = os.path.join(os.path.dirname(__file__), "docs")
-DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR).rstrip("/")
-DOCS_DIR = os.getenv("DOCS_DIR", DEFAULT_DOCS_DIR).rstrip("/")
+DEFAULT_DATA_DIR    = os.path.join(os.path.dirname(__file__), "data")
+DEFAULT_DOCS_DIR    = os.path.join(os.path.dirname(__file__), "docs")
+DATA_DIR            = os.getenv("DATA_DIR", DEFAULT_DATA_DIR).rstrip("/")
+DOCS_DIR            = os.getenv("DOCS_DIR", DEFAULT_DOCS_DIR).rstrip("/")
 
 # -------------------------------
 # OpenAI client (optional)
@@ -53,7 +48,7 @@ if OPENAI_API_KEY and not FAST_ONLY:
         logger.warning(f"[OpenAI] client init fail: {e}")
         client = None
 
-app = FastAPI(title="Jeju ChatPi (Callback)", version="2.1.0")
+app = FastAPI(title="Jeju ChatPi (Callback)", version="2.2.0")
 
 # -------------------------------
 # File helpers
@@ -200,7 +195,7 @@ async def polish_with_llm(utter: str, draft: str, timeout_s: float) -> Optional[
             ],
             temperature=0.2,
             max_tokens=MAX_TOKENS,
-            timeout=timeout_s,  # SDK 내부 타임아웃
+            timeout=timeout_s,
         )
         return (resp.choices[0].message.content or "").strip()
     except (APITimeoutError, APIConnectionError) as e:
@@ -211,11 +206,37 @@ async def polish_with_llm(utter: str, draft: str, timeout_s: float) -> Optional[
         return None
 
 # -------------------------------
+# Callback sender with small retry
+# -------------------------------
+def post_callback(callback_url: str, payload: dict) -> Tuple[bool, str]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        callback_url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    for attempt in range(1, 3):  # 최대 2회 재시도
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                body = r.read().decode("utf-8", "ignore")
+            return True, body
+        except Exception as e:
+            if attempt == 2:
+                return False, str(e)
+            time.sleep(0.6)  # 짧게 재시도
+    return False, "unknown"
+
+# -------------------------------
 # Routes
 # -------------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "mode": "callback" if USE_KAKAO_CALLBACK else "direct", "model": OPENAI_MODEL}
+    return {
+        "ok": True,
+        "mode": "callback" if USE_KAKAO_CALLBACK else "direct",
+        "model": OPENAI_MODEL
+    }
 
 @app.get("/health")
 def health():
@@ -238,14 +259,16 @@ async def kakao_skill(request: Request, background_tasks: BackgroundTasks):
 
     user_req    = (body.get("userRequest") or {})
     utter       = (user_req.get("utterance") or "").strip()
-    callbackUrl = user_req.get("callbackUrl")  # ✅ 콜백 URL (AI 챗봇 전환 시 제공)
+    callbackUrl = user_req.get("callbackUrl")
 
     # 내부 정보 차단
     if is_internal_probe(utter):
+        logger.info("[Guard] internal probe")
         return JSONResponse(kakao_text("비밀이에요 🤫 공식적으로 공개되지 않은 정보입니다."))
 
     # 짧은 인사 즉시 처리
     if is_short_greeting(utter):
+        logger.info("[Reply] SHORT_GREETING")
         return JSONResponse(kakao_text(short_greeting_reply()))
 
     # Draft 생성 (로컬 CSV 기반 초고속)
@@ -255,36 +278,23 @@ async def kakao_skill(request: Request, background_tasks: BackgroundTasks):
     if USE_KAKAO_CALLBACK and callbackUrl:
         logger.info("[Callback] useCallback start")
 
-        # 1) 즉시 응답 (템플릿 없음, data만 사용해도 되지만 여기선 waiting text를 data로)
+        # 1) 즉시 응답 (템플릿 없이 data만 사용, 콘솔에서 '스킬데이터 사용' 매핑 가능)
         immediate = {
             "version": "2.0",
             "useCallback": True,
             "data": {"text": CALLBACK_WAIT_TEXT}
         }
 
-        # 2) 백그라운드에서 최종안 작성 → callbackUrl로 POST
+        # 2) 백그라운드에서 LLM 다듬기(실패 시 draft) → callbackUrl로 POST
         async def job():
-            # 콜백 유효시간 내 안전한 LLM 시간 예산(최대 20초 제한)
             llm_budget_s = min(max((CALLBACK_MAX_MS - 2000) / 1000.0, 1.0), 20.0)
             final_text = await polish_with_llm(utter, draft, llm_budget_s)
             if not final_text:
                 final_text = draft
 
-            # 콜백으로 최종 말풍선 전송
-            try:
-                payload = kakao_bubble(final_text)
-                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                req = urllib.request.Request(
-                    callbackUrl,
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    resp_txt = r.read().decode("utf-8", "ignore")
-                logger.info(f"[Callback] sent ok: {resp_txt[:200]}")
-            except Exception as e:
-                logger.warning(f"[Callback] send fail: {e}")
+            payload = kakao_bubble(final_text)
+            ok, msg = post_callback(callbackUrl, payload)
+            logger.info(f"[Callback] sent={ok} msg={msg[:200]}")
 
         background_tasks.add_task(job)
         return JSONResponse(immediate)
