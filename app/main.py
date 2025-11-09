@@ -106,18 +106,32 @@ def kakao_bubble(text: str) -> dict:
     # 콜백으로 최종 말풍선을 보낼 때 그대로 사용
     return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}
 
+# 내부 노출 요구만 차단하도록 오탐 최소화 + 토글
+GUARD_ENABLED = os.getenv("GUARD_ENABLED", "1") == "1"
+
 def is_internal_probe(text: str) -> bool:
+    if not GUARD_ENABLED:
+        return False
     t = (text or "").lower()
-    # “보여줘/공개/원본/내용/설명” 같은 노출 요구가 있을 때만 발동
-    sensitive = ["지침", "룰엔진", "시스템 프롬프트", "system prompt", "prompt", "내부", "데이터셋"]
-    reveal_verbs = ["보여줘", "공개", "원문", "원본", "덤프", "출력", "내용", "설명", "어떻게 만들어졌", "설계"]
+
+    # 정말 '내부 지침/프롬프트/룰엔진'을 '보여달라'고 할 때만 차단
+    sensitive = [
+        "system prompt", "prompt", "시스템 프롬프트", "내부", "internal",
+        "지침", "룰엔진", "rule engine", "설정", "비밀", "시스템"
+    ]
+    reveal_verbs = [
+        "보여줘", "원문", "원본", "출력", "공개", "덤프", "누설", "노출",
+        "설명해줘", "어떻게 만들어졌", "코드", "소스", "source", "spec"
+    ]
+
     hit_sens = any(s in t for s in sensitive)
-    hit_verb  = any(v in t for v in reveal_verbs)
+    hit_verb = any(v in t for v in reveal_verbs)
+
     if hit_sens and hit_verb:
-        # 디버그: 어떤 키워드로 막혔는지 로그 남김
-        logging.info(f"[Guard] block hit (sens={hit_sens}, verb={hit_verb}) text='{t[:80]}'")
+        logging.info(f"[Guard] block hit (sens+verb) text='{t[:100]}'")
         return True
     return False
+
 
 
 def is_short_greeting(text: str) -> bool:
