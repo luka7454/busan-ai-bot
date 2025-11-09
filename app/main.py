@@ -43,12 +43,13 @@ DOCS_DIR            = os.getenv("DOCS_DIR", DEFAULT_DOCS_DIR).rstrip("/")
 client: Optional[OpenAI] = None
 if OPENAI_API_KEY and not FAST_ONLY:
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
+        from openai import OpenAI
+         client = OpenAI(api_key=OPENAI_API_KEY)
+         logger.info("[OpenAI] client init ok")
+except Exception as e:
         logger.warning(f"[OpenAI] client init fail: {e}")
         client = None
 
-app = FastAPI(title="Jeju ChatPi (Callback)", version="2.2.0")
 
 # -------------------------------
 # File helpers
