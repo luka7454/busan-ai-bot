@@ -44,8 +44,8 @@ client: Optional[OpenAI] = None
 if OPENAI_API_KEY and not FAST_ONLY:
     try:
         from openai import OpenAI
-         client = OpenAI(api_key=OPENAI_API_KEY)
-         logger.info("[OpenAI] client init ok")
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        logger.info("[OpenAI] client init ok")
 except Exception as e:
         logger.warning(f"[OpenAI] client init fail: {e}")
         client = None
